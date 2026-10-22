@@ -125,6 +125,35 @@ void apfs_sha1_init(apfs_sha1_ctx* ctx);
 void apfs_sha1_update(apfs_sha1_ctx* ctx, const void* data, size_t len);
 void apfs_sha1_final(apfs_sha1_ctx* ctx, uint8_t digest[20]);
 
+/* Ciphers, MACs and key derivation (crypto.c) */
+
+typedef struct {
+	uint32_t ek[60];              /* encryption round keys */
+	uint32_t dk[60];              /* decryption round keys */
+	int rounds;
+} apfs_aes_ctx;
+
+int apfs_aes_init(apfs_aes_ctx* ctx, const uint8_t* key, size_t len);
+void apfs_aes_encrypt(const apfs_aes_ctx* ctx, const uint8_t in[16], uint8_t out[16]);
+void apfs_aes_decrypt(const apfs_aes_ctx* ctx, const uint8_t in[16], uint8_t out[16]);
+void apfs_aes_cbc_encrypt(const apfs_aes_ctx* ctx, const uint8_t iv[16], const uint8_t* in, uint8_t* out, size_t len);
+void apfs_aes_cbc_decrypt(const apfs_aes_ctx* ctx, const uint8_t iv[16], const uint8_t* in, uint8_t* out, size_t len);
+void apfs_aes_ctr(const apfs_aes_ctx* ctx, const uint8_t iv[16], const uint8_t* in, uint8_t* out, size_t len);
+int apfs_des3_cbc_decrypt(const uint8_t key[24], const uint8_t iv[8], uint8_t* data, size_t len);
+
+typedef struct {
+	apfs_sha256_ctx inner;
+	apfs_sha256_ctx outer;
+} apfs_hmac_sha256_ctx;
+
+void apfs_hmac_sha256_init(apfs_hmac_sha256_ctx* ctx, const uint8_t* key, size_t len);
+void apfs_hmac_sha256_update(apfs_hmac_sha256_ctx* ctx, const void* data, size_t len);
+void apfs_hmac_sha256_final(apfs_hmac_sha256_ctx* ctx, uint8_t mac[32]);
+void apfs_hmac_sha256(const uint8_t* key, size_t klen, const void* data, size_t len, uint8_t mac[32]);
+void apfs_hmac_sha1(const uint8_t* key, size_t klen, const void* data, size_t len, uint8_t mac[20]);
+void apfs_pbkdf2_sha1(const char* pass, size_t plen, const uint8_t* salt, size_t slen, uint32_t iterations, uint8_t* out, size_t len);
+void apfs_hkdf_sha256(const uint8_t* ikm, size_t ilen, const uint8_t* salt, size_t slen, const void* info, size_t nlen, uint8_t* out, size_t len);
+
 /* Unicode (unicode.c) */
 
 /* Hash of a filename for a hashed directory record key, already shifted
@@ -605,6 +634,10 @@ int apfs_nx_resize(apfs_nx_t* nx, uint64_t new_size);
 
 int apfs_vol_unseal(apfs_vol_t* vol);
 int apfs_vol_seal_info(apfs_vol_t* vol, uint32_t* hash_type, uint8_t* root_hash, uint32_t* hash_size, xid_t* broken_xid);
+#define APFS_ROOT_HASH_METADATA_SIZE (16 + 3 * APFS_HASH_MAX_SIZE)
+/* Builds the payload of an IPSW .root_hash file: the sealed catalog hashes
+ * for 4 KiB, 8 KiB and 16 KiB APFS block sizes. */
+int apfs_vol_root_hash_metadata(apfs_vol_t* vol, uint8_t out[APFS_ROOT_HASH_METADATA_SIZE]);
 
 /* Consistency checks (verify.c) */
 

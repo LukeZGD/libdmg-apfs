@@ -6,7 +6,8 @@
 #
 # Every image is checked with "apfs-tool verify" after it changes. On macOS,
 # images are also checked with Apple's fsck_apfs (through hdiutil, which
-# needs no privileges); set APFS_TEST_FSCK=0 to skip that.
+# needs no privileges); set APFS_TEST_FSCK=0 to skip that. Set
+# APFS_TEST_NATIVE=0 to skip all tests that attach images with macOS tools.
 
 TOOL=$1
 WORK=$2
@@ -118,6 +119,9 @@ echo "# image creation"
 t "create a 64 MiB image" A img.raw create 64m -n Test
 t "the new image verifies" verify img.raw
 t "info names the volume" has "\"Test\"" img.raw info
+t "create a 16 MiB image" A small.raw create 16m
+t "it takes under 1 MiB of host disk" test "$(du -k small.raw | cut -f1)" -lt 1024
+rm -f small.raw
 t "create a case-insensitive image" A ci.raw create 32m -i -n Mac
 t "create a container with three volumes" A multi.raw create 2g -n System -r system --volume -n Data -r data --volume -n Preboot -r preboot
 t "the multi-volume container verifies" verify multi.raw
@@ -145,7 +149,17 @@ t "the new file takes under 1 MiB of host disk" test "$(du -k gig-new.raw | cut 
 t "it has the change" A gig-new.raw stat /new
 f "and the original does not" A gig.raw stat /new
 t "the new file verifies" verify gig-new.raw
-rm -f gig.raw gig-copy.raw gig-new.raw
+t "-o naming the image another way edits it in place" A gig.raw -o ./gig.raw mkdir /same
+t "the image has the change" A gig.raw stat /same
+t "-o naming the image by its full path edits it in place" A gig.raw -o "$WORK/gig.raw" mkdir /absolute
+t "the image has that change too" A gig.raw stat /absolute
+ln -s gig.raw gig-link.raw
+t "so does -o naming a link to it" A gig.raw -o gig-link.raw mkdir /linked
+t "the image has that change too" A gig.raw stat /linked
+f "raw export onto the image is refused" A gig.raw raw ./gig.raw
+f "so is a UDIF export through the link" A gig.raw dmg gig-link.raw
+t "the image is intact" verify gig.raw
+rm -f gig.raw gig-copy.raw gig-new.raw gig-link.raw
 f "a size that is too small fails" A tiny.raw create 100k
 f "and leaves no file behind" test -e tiny.raw
 
@@ -281,14 +295,14 @@ f "names that differ in case collide" A ci.raw mkdir /MIXEDCASE.txt
 t "the case-insensitive image verifies" verify ci.raw
 
 SEALER=/System/Library/Filesystems/apfs.fs/Contents/Resources/apfs_prepare_cryptex
-if [ -x $SEALER ] && command -v hdiutil >/dev/null 2>&1; then
+if [ "${APFS_TEST_NATIVE:-1}" != 0 ] && [ -x $SEALER ] && command -v hdiutil >/dev/null 2>&1; then
 	echo "# sealed volumes (sealed with apfs_prepare_cryptex)"
 	seal() {
 		dev=$(hdiutil attach -imagekey diskimage-class=CRawDiskImage -nomount "$1" 2>/dev/null | head -1 | awk '{print $1}')
 		[ -n "$dev" ] || return 1
 		vol=$(diskutil list "$dev" 2>/dev/null | awk '/APFS Volume/ {print $NF; exit}')
 		[ -n "$vol" ] || vol=$(diskutil list 2>/dev/null | awk -v n="$2" '$0 ~ "APFS Volume " n {print $NF; exit}')
-		$SEALER "/dev/$vol" >seal.out 2>&1
+		$SEALER -M sealed.metadata "/dev/$vol" >seal.out 2>&1
 		rc=$?
 		hdiutil detach "$dev" >/dev/null 2>&1 || hdiutil detach -force "$dev" >/dev/null 2>&1
 		return $rc
@@ -296,6 +310,11 @@ if [ -x $SEALER ] && command -v hdiutil >/dev/null 2>&1; then
 	t "make an image to seal" sh -c "'$TOOL' sealed.raw create 32m -n SealMe && '$TOOL' sealed.raw add -c lzfse src/sub/deeper/text.txt /text.txt && '$TOOL' sealed.raw add src/sub/r300k.bin /r300k.bin"
 	t "seal it" seal sealed.raw SealMe
 	t "info shows the root hash" has "root hash" sealed.raw info
+	t "write its IPSW root-hash companion" A sealed.raw root-hash sealed.root_hash
+	t "the root-hash metadata matches macOS" sh -c "test \$(wc -c < sealed.root_hash) -eq 229 && dd if=sealed.root_hash bs=1 skip=21 2>/dev/null | cmp -s - sealed.metadata"
+	t "another root-hash Image4 type is accepted" A sealed.raw root-hash sealed-csys.root_hash -t csys
+	t "the requested Image4 type was written" sh -c "test \"\$(dd if=sealed-csys.root_hash bs=1 skip=11 count=4 2>/dev/null)\" = csys"
+	f "root-hash refuses to overwrite its image" A sealed.raw root-hash ./sealed.raw
 	t "sealed files read" same sealed.raw /text.txt src/sub/deeper/text.txt
 	t "the sealed image verifies" verify sealed.raw
 	f "sealed volumes refuse changes" A sealed.raw rm /r300k.bin
@@ -373,6 +392,11 @@ t "files read from the UDIF image" same out.dmg /zlib.txt src/sub/deeper/text.tx
 t "modify the UDIF image in place" A out.dmg add src/hello.txt /added.txt
 t "the modified UDIF image reads" same out.dmg /added.txt src/hello.txt
 t "the modified UDIF image verifies" verify out.dmg
+t "-o naming the UDIF another way edits it in place" A out.dmg -o ./out.dmg mkdir /same-dmg
+ln -s out.dmg out-link.dmg
+t "-o through a link edits the UDIF in place" A out.dmg -o out-link.dmg mkdir /linked-dmg
+t "the UDIF has both in-place changes" sh -c "'$TOOL' out.dmg stat /same-dmg && '$TOOL' out.dmg stat /linked-dmg"
+t "the output link was preserved" test -L out-link.dmg
 t "export a zlib UDIF image without a partition map" A img.raw dmg bare.dmg -c zlib -b
 t "it verifies" verify bare.dmg
 t "export an IMG4 payload" A out.dmg im4p out.im4p -t rdsk -z
@@ -384,7 +408,7 @@ t "export the raw container" A out.im4p raw back.raw -c
 t "the raw export verifies" verify back.raw
 t "grow a UDIF image" A out.dmg grow 256m
 t "the grown UDIF image verifies" verify out.dmg
-if command -v hdiutil >/dev/null 2>&1; then
+if [ "${APFS_TEST_NATIVE:-1}" != 0 ] && command -v hdiutil >/dev/null 2>&1; then
 	t "hdiutil accepts the UDIF image" hdiutil verify out.dmg
 fi
 
@@ -401,6 +425,33 @@ t "dmg build" "$DMGTOOL" build whole.img rebuilt.dmg -c lzfse
 t "the rebuilt image verifies" verify rebuilt.dmg
 t "files read from the rebuilt image" same rebuilt.dmg /added.txt src/hello.txt
 f "dmg extract of a raw image fails" "$DMGTOOL" extract whole.img nothing.img
+f "dmg extract onto its input is refused" "$DMGTOOL" extract out.dmg ./out.dmg
+f "so is dmg build onto its input" "$DMGTOOL" build whole.img ./whole.img
+t "both are intact" sh -c "'$DMGTOOL' verify out.dmg && cmp -s whole.img whole.raw"
+
+if [ -x /usr/bin/aea ]; then
+	echo "# Apple Encrypted Archives"
+	AEAKEY=000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f
+	t "wrap a UDIF image in AEA" /usr/bin/aea encrypt -i out.dmg -o out.dmg.aea -profile 1 -a lzfse -checksum sha256 -padding none -key-value "hex:$AEAKEY"
+	t "apfs-tool reads the AEA-wrapped image" sh -c "'$TOOL' out.dmg.aea -k '$AEAKEY' cat /added.txt | cmp -s - src/hello.txt"
+	t "dmg reads the AEA-wrapped image" "$DMGTOOL" info out.dmg.aea -k "$AEAKEY"
+	t "dmg extracts the AEA-wrapped image" "$DMGTOOL" extract out.dmg.aea aea.img -k "$AEAKEY"
+	t "the AEA extraction matches" cmp -s aea.img whole.img
+	f "a wrong AEA key is refused" A out.dmg.aea -k 000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e00 info
+	f "an AEA archive is not modified in place" A out.dmg.aea -k "$AEAKEY" mkdir /bad
+	t "AEA changes can be saved decrypted with -o" A out.dmg.aea -k "$AEAKEY" -o aea-new.dmg mkdir /from-aea
+	t "the decrypted output has the change" A aea-new.dmg stat /from-aea
+fi
+
+if [ "${APFS_TEST_NATIVE:-1}" != 0 ] && command -v hdiutil >/dev/null 2>&1; then
+	echo "# encrypted DMGs"
+	t "create an encrypted DMG" sh -c "printf secret | hdiutil create -size 20m -fs APFS -volname Encrypted -encryption AES-128 -stdinpass enc.dmg"
+	t "read the encrypted DMG with -k" sh -c "key=\$('$DMGTOOL' info enc.dmg -p secret | sed -n 's/^encrypted:.* key //p') && test -n \"\$key\" && '$TOOL' enc.dmg -k \"\$key\" info >/dev/null"
+	t "modify and re-encrypt the DMG with -k" sh -c "key=\$('$DMGTOOL' info enc.dmg -p secret | sed -n 's/^encrypted:.* key //p') && '$TOOL' enc.dmg -k \"\$key\" mkdir /encrypted"
+	t "the encrypted DMG keeps the change" sh -c "key=\$('$DMGTOOL' info enc.dmg -p secret | sed -n 's/^encrypted:.* key //p') && '$TOOL' enc.dmg -k \"\$key\" stat /encrypted"
+	t "dmg extracts the encrypted image with -k" sh -c "key=\$('$DMGTOOL' info enc.dmg -p secret | sed -n 's/^encrypted:.* key //p') && '$DMGTOOL' extract enc.dmg enc.raw -k \"\$key\""
+	t "the extracted encrypted image verifies" verify enc.raw
+fi
 
 echo "# trust caches"
 t "a volume without code gives an empty cache" sh -c "'$TOOL' img.raw trustcache empty.trustcache && test \$(wc -c < empty.trustcache) -eq 24"
@@ -426,9 +477,9 @@ fi
 
 echo "# mtree"
 t "mtree writes a specification" sh -c "'$TOOL' img.raw mtree spec.mtree -T 1600000000 && grep -q '^/set type=file xattrsdigest=none.0\$' spec.mtree && grep -q 'ptime=1600000000.000000000' spec.mtree"
-t "mtree -t msys writes an IMG4 payload" sh -c "'$TOOL' img.raw mtree spec.im4p -t msys && head -c 16 spec.im4p | grep -q msys"
+t "mtree -t msys writes an IMG4 payload" sh -c "'$TOOL' img.raw mtree spec.im4p -t msys && head -c 32 spec.im4p | grep -q msys"
 f "mtree rejects a bad time" A img.raw mtree bad.mtree -T soon
-if command -v hdiutil >/dev/null 2>&1 && command -v mtree >/dev/null 2>&1 && command -v aa >/dev/null 2>&1; then
+if [ "${APFS_TEST_NATIVE:-1}" != 0 ] && command -v hdiutil >/dev/null 2>&1 && command -v mtree >/dev/null 2>&1 && command -v aa >/dev/null 2>&1; then
 	echo "# mtree (checked against macOS mtree and aa)"
 	mt_image() {
 		"$TOOL" mt.raw create 32m -n MtreeTest >/dev/null &&
@@ -488,6 +539,9 @@ f "a missing image fails" A missing.raw ls /
 f "an unknown command fails" A img.raw frobnicate
 f "cat of a directory fails" A img.raw cat /
 f "mkdir over a file fails" A img.raw mkdir /zlib.txt
+f "extract onto the image is refused" A img.raw extract /lzvn.txt ./img.raw
+f "so is a trust cache" A img.raw trustcache ./img.raw
+f "and an mtree" A img.raw mtree ./img.raw
 t "the image is still consistent" verify img.raw
 
 echo

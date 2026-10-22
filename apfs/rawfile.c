@@ -12,6 +12,7 @@
 #include "apfs/apfs.h"
 #include "apfs/image.h"
 #include "apfs/platform.h"
+#include "apfs/platform.h"
 
 typedef struct {
 	FILE* f;
@@ -54,7 +55,10 @@ static int raw_write(io_func* io, off_t location, size_t size, void* buffer) {
 
 static void raw_close(io_func* io) {
 	rawfile_t* r = (rawfile_t*)io->data;
-	fflush(r->f);
+	if(r->writable)
+		plat_sparse_finish(r->f);
+	else
+		fflush(r->f);
 	fclose(r->f);
 	free(r);
 	free(io);
@@ -107,11 +111,15 @@ uint64_t apfs_rawfile_size(io_func* io) {
 	return ((rawfile_t*)io->data)->size;
 }
 
+/* Lets other streams of the file read what was written */
+int apfs_rawfile_flush(io_func* io) {
+	return fflush(((rawfile_t*)io->data)->f) == 0 ? APFS_OK : APFS_EIO;
+}
+
 int apfs_rawfile_truncate(io_func* io, uint64_t size) {
 	rawfile_t* r = (rawfile_t*)io->data;
 	if(size > r->size) {
-		uint8_t zero = 0;
-		if(fseeko(r->f, (off_t)(size - 1), SEEK_SET) != 0 || fwrite(&zero, 1, 1, r->f) != 1)
+		if(plat_sparse_file(r->f, size) < 0)
 			return APFS_EIO;
 		r->size = size;
 		return APFS_OK;

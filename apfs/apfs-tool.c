@@ -190,8 +190,17 @@ static int cmd_cat(ctx_t* c, int argc, char** argv) {
 	return apfslib_cat(c->vol, argv[1], stdout) < 0;
 }
 
+/* Refuses an output file that is the image itself, which writing would
+ * destroy */
+static int is_image(ctx_t* c, const char* path) {
+	if(!plat_same_file(path, c->image_path))
+		return 0;
+	fprintf(stderr, "error: %s is the image itself\n", path);
+	return 1;
+}
+
 static int cmd_extract(ctx_t* c, int argc, char** argv) {
-	if(!need(argc, 3, "extract <path> <dest>"))
+	if(!need(argc, 3, "extract <path> <dest>") || is_image(c, argv[2]))
 		return 1;
 	return apfslib_extract(c->vol, argv[1], argv[2]) < 0;
 }
@@ -695,7 +704,7 @@ static int cmd_unseal(ctx_t* c, int argc, char** argv) {
 
 static int cmd_export(ctx_t* c, int argc, char** argv) {
 	int ret;
-	if(!need(argc, 2, "dmg <out.dmg> [-c lzfse|zlib|raw] [-b] [-n] | raw <out> [-c] | im4p <out> [-t type] [-d desc] [-z]"))
+	if(!need(argc, 2, "dmg <out.dmg> [-c lzfse|zlib|raw] [-b] [-n] | raw <out> [-c] | im4p <out> [-t type] [-d desc] [-z]") || is_image(c, argv[1]))
 		return 1;
 	ret = apfs_image_export(c->img, argv[0], argv[1], argc - 2, argv + 2);
 	if(ret < 0)
@@ -727,6 +736,10 @@ static int cmd_trustcache(ctx_t* c, int argc, char** argv) {
 	}
 	if(ret < 0 || !out || (version && version != 1 && version != 2) || (type && strlen(type) != 4)) {
 		fprintf(stderr, "usage: trustcache <out> [path...] [-v 1|2] [-t type] [-m trustcache]\n");
+		free(paths);
+		return 1;
+	}
+	if(is_image(c, out)) {
 		free(paths);
 		return 1;
 	}
@@ -769,6 +782,8 @@ static int cmd_mtree(ctx_t* c, int argc, char** argv) {
 		fprintf(stderr, "usage: mtree <out> [-T seconds] [-t type]\n");
 		return 1;
 	}
+	if(is_image(c, out))
+		return 1;
 	if(!have_time) {
 		/* Apple's files carry the time of the build; default to the root directory's */
 		apfs_inode_t root;
@@ -786,6 +801,38 @@ static int cmd_mtree(ctx_t* c, int argc, char** argv) {
 	if(ret < 0)
 		fprintf(stderr, "error: cannot write %s: %s\n", out, apfs_strerror(ret));
 	free(spec);
+	return ret < 0;
+}
+
+static int cmd_root_hash(ctx_t* c, int argc, char** argv) {
+	const char* out = NULL;
+	const char* type = "isys";
+	uint8_t metadata[APFS_ROOT_HASH_METADATA_SIZE];
+	int i, ret = APFS_OK;
+
+	for(i = 1; i < argc; i++) {
+		if(!strcmp(argv[i], "-t") && i + 1 < argc) {
+			type = argv[++i];
+		} else if(argv[i][0] == '-' || out) {
+			ret = APFS_EINVAL;
+		} else {
+			out = argv[i];
+		}
+	}
+	if(ret < 0 || !out || strlen(type) != 4) {
+		fprintf(stderr, "usage: root-hash <out> [-t type]\n");
+		return 1;
+	}
+	if(is_image(c, out))
+		return 1;
+	ret = apfs_vol_root_hash_metadata(c->vol, metadata);
+	if(ret < 0) {
+		fprintf(stderr, "error: cannot build the root-hash metadata: %s\n", apfs_strerror(ret));
+		return 1;
+	}
+	ret = apfs_im4p_save(type, "0", metadata, sizeof(metadata), out);
+	if(ret < 0)
+		fprintf(stderr, "error: cannot write %s: %s\n", out, apfs_strerror(ret));
 	return ret < 0;
 }
 
@@ -940,15 +987,21 @@ static const command_t commands[] = {
 	{ "im4p", cmd_export, 0, 0 },
 	{ "trustcache", cmd_trustcache, 0, 1 },
 	{ "mtree", cmd_mtree, 0, 1 },
+	{ "root-hash", cmd_root_hash, 0, 1 },
+	{ "root_hash", cmd_root_hash, 0, 1 },
 	{ NULL, NULL, 0, 0 }
 };
 
 static void usage(const char* prog) {
 	printf("apfs-tool %s - create and modify APFS images\n\n", APFS_TOOL_VERSION);
-	printf("usage: %s <image> [-V volume] [-S snapshot] [-o output] [-t tmpdir] [-q] [-v] <command> [arguments]\n", prog);
+	printf("usage: %s <image> [-V volume] [-S snapshot] [-o output] [-t tmpdir] [-k key | -p passphrase] [-q] [-v]\n", prog);
+	printf("                  <command> [arguments]\n");
 	printf("       %s <image> create <size> [options]\n\n", prog);
-	printf("<image> may be a raw image (bare or GPT), a UDIF disk image (.dmg) or an IMG4 payload (.im4p).\n");
-	printf("Modified disk images and payloads are written back in their original format (or to -o).\n\n");
+	printf("<image> may be a raw image (bare or GPT), a UDIF disk image (.dmg), an IMG4 payload (.im4p),\n");
+	printf("an encrypted disk image (hdiutil -encryption) or an Apple Encrypted Archive (.aea).\n");
+	printf("Modified disk images and payloads are written back in their original format (or to -o).\n");
+	printf("Encrypted disk images take -p or -k (the AES key, then the HMAC key, in hex); AEA archives take\n");
+	printf("-k (hex or base64) and are not written: save modified ones elsewhere with -o.\n\n");
 	printf("hfsplus-compatible commands:\n");
 	printf("  ls [-R] [-i] [path]                      list a directory, or describe a file\n");
 	printf("  cat <path>                               write a file to standard output\n");
@@ -987,6 +1040,8 @@ static void usage(const char* prog) {
 	printf("  mtree <out> [-T seconds] [-t type]       write the volume's canonical metadata as an mtree\n");
 	printf("                                           spec (-T: Apple's build time, default the root\n");
 	printf("                                           directory's; -t msys: as an IPSW .mtree payload)\n");
+	printf("  root-hash <out> [-t type]                write the sealed-volume .root_hash IM4P\n");
+	printf("                                           (default type isys)\n");
 	printf("\ncreate options:\n");
 	printf("  -b <bytes> block size   -u <uuid> container UUID   -f raw|dmg|im4p output format\n");
 	printf("  -n <name> volume name   -r <role> system, data, preboot, recovery, update, vm, xart, hardware, none\n");
@@ -1030,6 +1085,10 @@ int main(int argc, char* argv[]) {
 			out_path = argv[++i];
 		} else if(!strcmp(argv[i], "-t") && i + 1 < argc) {
 			apfs_image_tmpdir = argv[++i];
+		} else if(!strcmp(argv[i], "-k") && i + 1 < argc) {
+			apfs_image_key = argv[++i];
+		} else if(!strcmp(argv[i], "-p") && i + 1 < argc) {
+			apfs_image_passphrase = argv[++i];
 		} else if(!strcmp(argv[i], "-q")) {
 			apfs_verbosity = 0;
 		} else if(!strcmp(argv[i], "-v")) {

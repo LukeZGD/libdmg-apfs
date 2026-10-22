@@ -32,15 +32,19 @@ LZFSE and LZVN come from Apple's reference implementation, included in
 ## Usage
 
 ```
-apfs-tool <image> [-V volume] [-S snapshot] [-o output] [-t tmpdir] [-q] [-v] <command> [arguments]
+apfs-tool <image> [-V volume] [-S snapshot] [-o output] [-t tmpdir] [-k key|-p passphrase] [-q] [-v] <command> [arguments]
 apfs-tool <image> create <size> [options]
 ```
 
 `<image>` can be a raw disk image (a bare container, or a GPT disk with an
-APFS partition), a UDIF disk image or an IMG4 payload. Changes to a `.dmg` or
+APFS partition), a UDIF disk image, an IMG4 payload, an `encrcdsa` encrypted
+disk image, or an Apple Encrypted Archive (`.aea`). Changes to a `.dmg` or
 `.im4p` are made on a temporary raw copy (in `-t tmpdir`, or next to the
 image) and written back in the original format, with the same compression,
 when the command finishes; `-o` writes the result to another file instead.
+Encrypted disk images take `-k` or `-p` and stay encrypted when rewritten.
+AEA archives take a 32-byte `-k` key, are read-only, and require `-o` for a
+modified, decrypted output image.
 
 `-V` selects a volume by index or name (the first volume by default), `-S`
 opens a snapshot of it read-only.
@@ -124,6 +128,7 @@ paths are made relative and `..` components are refused.
 | `im4p <out> [-t type] [-d desc] [-z]` | export an IMG4 payload (`-z`: LZFSE) |
 | `trustcache <out> [path...] [-v 1\|2] [-t type] [-m cache]` | write a trust cache of the signed code ([below](#trust-caches)) |
 | `mtree <out> [-T seconds] [-t type]` | write the canonical metadata of a system volume ([below](#system-volume-metadata)) |
+| `root-hash <out> [-t type]` | write a sealed volume's IPSW `.root_hash` payload ([below](#root-hashes)) |
 
 ### Creating images
 
@@ -159,13 +164,15 @@ dmg verify in.dmg                         # check the data checksums
 ```
 
 `dmg iso` and `dmg dmg` work as aliases of `extract` and `build`, as in
-libdmg-hfsplus. FileVault-encrypted images (`-k`) are not supported.
+libdmg-hfsplus. `extract`, `info` and `verify` accept `encrcdsa` images with
+`-p <passphrase>` or `-k <key>` (the AES key followed by the HMAC-SHA1 key,
+in hex), and AEA archives with a 32-byte hex or base64 `-k <key>`.
 
 ## Restore images
 
 Root file systems and ramdisks in IPSWs are UDIF images (`.dmg`) holding a GPT
-disk with one APFS partition, or IMG4 payloads (`.im4p`, type `rdsk`)
-wrapping such an image. apfs-tool opens them directly:
+disk with one APFS partition, IMG4 payloads (`.im4p`, type `rdsk`), or AEA
+archives (`.dmg.aea`) wrapping either form. apfs-tool opens them directly:
 
 ```sh
 apfs-tool 096-12345-678.dmg ls /usr/bin
@@ -191,11 +198,6 @@ without scanning first. IMG4 payloads are rewritten with their type and
 description, optionally LZFSE-compressed; signatures and manifests are not
 handled, so a modified payload has to be signed again for a device that
 checks it.
-
-Some things in IPSWs are outside apfs-tool's scope: the `.root_hash` files
-that accompany system volumes are not generated (sealing happens on the
-device during the restore), and AEA-encrypted images (`.dmg.aea`) must be
-decrypted first.
 
 ### Trust caches
 
@@ -257,6 +259,20 @@ lzfse` writes) inside an IMG4 payload. For the tvOS 16.4 recovery image, the
 text matches Apple's file except for the comments at the top (user,
 machine, tree and date).
 
+### Root hashes
+
+IPSWs accompany a sealed system volume with `Firmware/<system>.dmg.root_hash`.
+`root-hash` writes that 229-byte IM4P directly from the selected volume:
+
+```sh
+apfs-tool sealed.dmg root-hash sealed.dmg.root_hash
+```
+
+The default Image4 type is `isys` (System Volume Root Hash); `-t csys` or
+`-t xsys` selects the base-system or x86 form. The payload contains SHA-256
+seals for the catalog laid out with 4 KiB, 8 KiB and 16 KiB APFS blocks, as
+Apple's restore files do. The volume must already be sealed and unbroken.
+
 ### Sealed volumes
 
 Sealed volumes (macOS system volumes, cryptexes) can be read, and `info`
@@ -288,8 +304,6 @@ these also run `fsck_apfs` on the images (`APFS_TEST_FSCK=0` turns that off).
 - Fusion (two-device) containers and encryption rolling are not supported.
 - Snapshot deletion releases the blocks only that snapshot used; extended
   snapshot metadata (`snap_meta_ext`) is left in place.
-- FileVault-encrypted (`encrcdsa`) disk images from old IPSWs are not
-  supported; libdmg-hfsplus handles those.
 
 ## Library
 

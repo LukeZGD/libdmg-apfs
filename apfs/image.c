@@ -15,6 +15,7 @@
 #include "apfs/apfs.h"
 #include "apfs/image.h"
 #include "apfs/udif.h"
+#include "apfs/encrypted.h"
 #include "apfs/platform.h"
 #include "lzfse.h"
 
@@ -24,6 +25,8 @@ static const uint8_t gpt_apfs_type[16] = {
 };
 
 const char* apfs_image_tmpdir = NULL;
+const char* apfs_image_key = NULL;
+const char* apfs_image_passphrase = NULL;
 
 static int has_nxsb(io_func* io, uint64_t off) {
 	uint8_t buf[64];
@@ -430,6 +433,7 @@ typedef struct {
 	int imagescan;
 	im4p_state_t im4p;
 	uint64_t raw_len;
+	encrcdsa_info_t* encr;        /* how to encrypt an encrypted image again */
 } pack_state_t;
 
 static char* work_path_for(const char* path) {
@@ -475,6 +479,7 @@ static void image_free(apfs_image_t* img) {
 	if(ps) {
 		free(ps->im4p.desc);
 		free(ps->im4p.img4_tail);
+		encrcdsa_info_free(ps->encr);
 		free(ps);
 	}
 	free(img->out_path);
@@ -495,8 +500,104 @@ static int copy_file(const char* src, const char* dst) {
 	return ret;
 }
 
+static pack_state_t* pack_state(apfs_image_t* img) {
+	if(!img->format_state)
+		img->format_state = apfs_calloc(1, sizeof(pack_state_t));
+	return (pack_state_t*)img->format_state;
+}
+
+/* A UDIF disk image in af, which this takes over */
+static int open_udif(apfs_image_t* img, AbstractFile* af) {
+	udif_t* u = udif_open(af);
+	pack_state_t* ps;
+	FILE* w;
+	int ret;
+
+	if(!u) {
+		APFS_ERR("%s is not a supported disk image", img->path);
+		af->close(af);
+		return APFS_EINVAL;
+	}
+	img->format = APFS_IMG_DMG;
+	ps = pack_state(img);
+	ps->compression = udif_main_compression(u);
+	ps->imagescan = 1;
+	if(!img->writable) {
+		img->io = udif_io(u);
+		return open_container(img, udif_sectors(u) * UDIF_SECTOR);
+	}
+	img->work_path = work_path_for(img->path);
+	w = fopen(img->work_path, "w+b");
+	if(!w) {
+		APFS_ERR("cannot create working file %s", img->work_path);
+		udif_close(u);
+		return APFS_EIO;
+	}
+	ret = udif_extract(u, -1, w, apfs_verbosity < 2);
+	fclose(w);
+	ps->raw_len = udif_sectors(u) * UDIF_SECTOR;
+	udif_close(u);
+	if(ret < 0)
+		return ret;
+	img->io = apfs_rawfile_open(img->work_path, 1);
+	return img->io ? open_container(img, ps->raw_len) : APFS_EIO;
+}
+
+/* An encrypted image or archive in af, which this takes over: the disk
+ * image it holds is read through a view that decrypts it */
+static int open_encrypted(apfs_image_t* img, AbstractFile* af) {
+	int aea = aea_probe(af);
+	uint8_t* key = NULL;
+	size_t klen = 0;
+	AbstractFile* view;
+	io_func* io;
+	const char* dst;
+	uint64_t len;
+	int ret;
+
+	if(apfs_image_key && apfs_parse_key(apfs_image_key, &key, &klen) < 0) {
+		APFS_ERR("invalid key: give it as hex digits or base64");
+		af->close(af);
+		return APFS_EINVAL;
+	}
+	if(aea && img->writable && plat_same_file(img->out_path, img->path)) {
+		APFS_ERR("%s is an encrypted archive, which apfs-tool cannot write; save the changes elsewhere with -o", img->path);
+		free(key);
+		af->close(af);
+		return APFS_EROFS;
+	}
+	view = aea ? aea_open(af, key, klen) :
+		encrcdsa_open(af, key, klen, apfs_image_passphrase, img->writable ? &pack_state(img)->encr : NULL);
+	free(key);
+	if(!view)
+		return APFS_EINVAL;
+	if(udif_probe(view))
+		return open_udif(img, view);
+
+	/* a raw disk, read through the view or written in a decrypted copy:
+	 * the one of an archive goes to -o, the one of an encrypted image is
+	 * encrypted again on close */
+	img->format = APFS_IMG_RAW;
+	len = (uint64_t)view->getLength(view);
+	io = IOFuncFromAbstractFile(view);
+	if(!img->writable) {
+		img->io = io;
+		return open_container(img, len);
+	}
+	if(!aea)
+		img->work_path = work_path_for(img->path);
+	dst = aea ? img->out_path : img->work_path;
+	ret = export_raw(io, 0, len, dst);
+	CLOSE(io);
+	if(ret < 0)
+		return ret;
+	img->io = apfs_rawfile_open(dst, 1);
+	return img->io ? open_container(img, len) : APFS_EIO;
+}
+
 int apfs_image_open_ex(const char* path, int writable, const char* out_path, apfs_image_t** out) {
 	apfs_image_t* img;
+	AbstractFile* af;
 	FILE* f;
 	uint64_t flen;
 	int ret;
@@ -505,6 +606,13 @@ int apfs_image_open_ex(const char* path, int writable, const char* out_path, apf
 	img->path = apfs_strdup(path);
 	img->writable = writable;
 	img->out_path = apfs_strdup(out_path ? out_path : path);
+	/* An alias of the input means "edit in place" too.  Repackers replace
+	 * their output with a temporary file, so keeping a symlink or hard-link
+	 * spelling here would replace that directory entry instead of the input. */
+	if(writable && out_path && plat_same_file(path, out_path)) {
+		free(img->out_path);
+		img->out_path = apfs_strdup(path);
+	}
 
 	f = fopen(path, "rb");
 	if(!f) {
@@ -515,54 +623,19 @@ int apfs_image_open_ex(const char* path, int writable, const char* out_path, apf
 	fseeko(f, 0, SEEK_END);
 	flen = (uint64_t)ftello(f);
 
-	/* UDIF disk image? */
-	{
-		AbstractFile* af = createAbstractFileFromFile(f);
-		if(udif_probe(af)) {
-			udif_t* u = udif_open(af);
-			pack_state_t* ps;
-			if(!u) {
-				APFS_ERR("%s is not a supported disk image", path);
-				image_free(img);
-				return APFS_EINVAL;
-			}
-			img->format = APFS_IMG_DMG;
-			ps = (pack_state_t*)apfs_calloc(1, sizeof(pack_state_t));
-			ps->compression = udif_main_compression(u);
-			ps->imagescan = 1;
-			img->format_state = ps;
-			if(!writable) {
-				img->io = udif_io(u);
-				ret = open_container(img, udif_sectors(u) * UDIF_SECTOR);
-			} else {
-				FILE* w;
-				img->work_path = work_path_for(path);
-				w = fopen(img->work_path, "w+b");
-				if(!w) {
-					APFS_ERR("cannot create working file %s", img->work_path);
-					udif_close(u);
-					image_free(img);
-					return APFS_EIO;
-				}
-				ret = udif_extract(u, -1, w, apfs_verbosity < 2);
-				fclose(w);
-				ps->raw_len = udif_sectors(u) * UDIF_SECTOR;
-				udif_close(u);
-				if(ret == APFS_OK) {
-					img->io = apfs_rawfile_open(img->work_path, 1);
-					ret = img->io ? open_container(img, ps->raw_len) : APFS_EIO;
-				}
-			}
-			if(ret < 0) {
-				image_free(img);
-				return ret;
-			}
-			*out = img;
-			return APFS_OK;
+	/* encrypted image or archive, or UDIF disk image? */
+	af = createAbstractFileFromFile(f);
+	if(encrcdsa_probe(af) || aea_probe(af) || udif_probe(af)) {
+		ret = encrcdsa_probe(af) || aea_probe(af) ? open_encrypted(img, af) : open_udif(img, af);
+		if(ret < 0) {
+			image_free(img);
+			return ret;
 		}
-		/* keep using f below; the AbstractFile wrapper only owns it on success */
-		free(af);
+		*out = img;
+		return APFS_OK;
 	}
+	/* keep using f below; the AbstractFile wrapper only owns it when used */
+	free(af);
 
 	/* IMG4 payload? */
 	{
@@ -622,7 +695,9 @@ int apfs_image_open_ex(const char* path, int writable, const char* out_path, apf
 
 	/* raw image */
 	img->format = APFS_IMG_RAW;
-	if(writable && out_path && strcmp(out_path, path) != 0) {
+	/* -o naming the image itself, by whatever path, edits it in place:
+	 * copying a file onto itself would empty it */
+	if(writable && out_path && !plat_same_file(path, out_path)) {
 		ret = copy_file(path, out_path);
 		if(ret < 0) {
 			APFS_ERR("cannot copy %s to %s", path, out_path);
@@ -668,13 +743,43 @@ static int block_range_free(void* ctx, uint64_t off, uint64_t len) {
 	return 1;
 }
 
-/* Packs the working copy of a DMG */
+/* Encrypts a plain file to the output, with the header (and so the keys
+ * and the passphrase) of the encrypted image it came from */
+static int save_encrypted(apfs_image_t* img, const char* plain, uint64_t len) {
+	pack_state_t* ps = (pack_state_t*)img->format_state;
+	char* tmp = (char*)apfs_malloc(strlen(img->out_path) + 16);
+	FILE* in = fopen(plain, "rb");
+	FILE* out = NULL;
+	int ret = APFS_EIO;
+
+	sprintf(tmp, "%s.apfs-tool", img->out_path);
+	if(in && (out = fopen(tmp, "wb")) != NULL) {
+		ret = encrcdsa_save(ps->encr, in, len, out);
+		if(fclose(out) != 0 && ret == APFS_OK)
+			ret = APFS_EIO;
+		if(ret == APFS_OK) {
+			remove(img->out_path);
+			if(rename(tmp, img->out_path) != 0)
+				ret = APFS_EIO;
+		}
+		if(ret < 0)
+			remove(tmp);
+	}
+	if(in)
+		fclose(in);
+	free(tmp);
+	return ret;
+}
+
+/* Packs the working copy of a DMG; an encrypted one is packed to a plain
+ * file first */
 static int repack_dmg(apfs_image_t* img) {
 	pack_state_t* ps = (pack_state_t*)img->format_state;
 	udif_build_opts_t o;
 	free_ctx_t fc;
 	char* tmp;
 	FILE* out;
+	uint64_t size;
 	const char* names[NX_MAX_FILE_SYSTEMS];
 	const char* uuids[NX_MAX_FILE_SYSTEMS];
 	char uuidbuf[NX_MAX_FILE_SYSTEMS][37];
@@ -712,8 +817,8 @@ static int repack_dmg(apfs_image_t* img) {
 	o.volume_names = names;
 	o.volume_uuids = uuids;
 
-	tmp = (char*)apfs_malloc(strlen(img->out_path) + 16);
-	sprintf(tmp, "%s.apfs-tool", img->out_path);
+	tmp = (char*)apfs_malloc(strlen(ps->encr ? img->work_path : img->out_path) + 16);
+	sprintf(tmp, "%s.%s", ps->encr ? img->work_path : img->out_path, ps->encr ? "dmg" : "apfs-tool");
 	out = fopen(tmp, "wb");
 	if(!out) {
 		free(tmp);
@@ -722,9 +827,13 @@ static int repack_dmg(apfs_image_t* img) {
 	if(apfs_verbosity >= 1)
 		printf("Packing %s (%s)...\n", img->out_path, udif_format_name(o.compression));
 	ret = udif_build(img->io, disk_bytes, out, &o);
+	size = (uint64_t)ftello(out);
 	if(fclose(out) != 0 && ret == APFS_OK)
 		ret = APFS_EIO;
-	if(ret == APFS_OK) {
+	if(ret == APFS_OK && ps->encr) {
+		ret = save_encrypted(img, tmp, size);
+		remove(tmp);
+	} else if(ret == APFS_OK) {
 		remove(img->out_path);
 		if(rename(tmp, img->out_path) != 0)
 			ret = APFS_EIO;
@@ -761,6 +870,11 @@ int apfs_image_close(apfs_image_t* img, int save) {
 				if(ret < 0)
 					remove(tmp);
 				free(tmp);
+			} else if(img->format_state && ((pack_state_t*)img->format_state)->encr) {
+				/* a raw disk in an encrypted image */
+				ret = apfs_rawfile_flush(img->io);
+				if(ret == APFS_OK)
+					ret = save_encrypted(img, img->work_path, apfs_rawfile_size(img->io));
 			}
 		}
 		apfs_nx_close(img->nx);
@@ -817,7 +931,7 @@ int apfs_image_grow(apfs_image_t* img, uint64_t new_size) {
 /* Runs of zeros are skipped, so the output is sparse where the host file
  * system allows it: free space in large images costs no disk space */
 static int export_raw(io_func* io, uint64_t off, uint64_t len, const char* path) {
-	FILE* f = fopen(path, "wb");
+	FILE* f = fopen(path, "w+b");
 	uint8_t* buf;
 	uint64_t pos = 0;
 	int ret = APFS_OK;
@@ -838,6 +952,8 @@ static int export_raw(io_func* io, uint64_t off, uint64_t len, const char* path)
 		pos += n;
 	}
 	free(buf);
+	if(ret == APFS_OK)
+		ret = plat_sparse_finish(f);
 	if(fclose(f) != 0 && ret == APFS_OK)
 		ret = APFS_EIO;
 	return ret;
@@ -855,6 +971,12 @@ int apfs_image_export(apfs_image_t* img, const char* fmt, const char* out_path, 
 	apfs_nx_t* nx = img->nx;
 	uint64_t container = LE64(nx->sb->nx_block_count) * nx->bs;
 	int i, ret = APFS_OK;
+
+	/* writing the image while reading it would destroy it */
+	if(plat_same_file(out_path, img->path)) {
+		APFS_ERR("%s is the image itself", out_path);
+		return APFS_EINVAL;
+	}
 
 	if(!strcmp(fmt, "raw")) {
 		int only_container = argc > 0 && !strcmp(argv[0], "-c");

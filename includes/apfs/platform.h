@@ -52,8 +52,12 @@ int plat_xattr_set(const char* path, const char* name, const uint8_t* data, size
 char* plat_join(const char* dir, const char* name);
 int plat_exists(const char* path);
 int plat_remove(const char* path);
+int plat_same_file(const char* a, const char* b);
 char* plat_temp_path(const char* hint);
 int plat_sparse_file(FILE* f, uint64_t size);
+/* On macOS, discard zero blocks that short-file write clustering may have
+ * allocated despite the file having been created sparse. */
+int plat_sparse_finish(FILE* f);
 int plat_write_sparse(FILE* f, uint64_t off, const void* data, size_t len);
 
 #endif

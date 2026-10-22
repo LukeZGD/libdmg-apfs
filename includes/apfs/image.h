@@ -39,12 +39,16 @@ io_func* apfs_rawfile_open(const char* path, int writable);
 io_func* apfs_rawfile_create(const char* path, uint64_t size);
 uint64_t apfs_rawfile_size(io_func* io);
 int apfs_rawfile_truncate(io_func* io, uint64_t size);
+int apfs_rawfile_flush(io_func* io);
 
 /* Locates an APFS container inside a raw device. Returns its byte offset and,
  * when partitioned, the partition length. */
 int apfs_find_container(io_func* io, uint64_t dev_size, uint64_t* base, uint64_t* length);
 
 extern const char* apfs_image_tmpdir;
+/* The key (hex or base64) or passphrase of encrypted images and archives */
+extern const char* apfs_image_key;
+extern const char* apfs_image_passphrase;
 
 int apfs_image_open(const char* path, int writable, apfs_image_t** out);
 int apfs_image_open_ex(const char* path, int writable, const char* out_path, apfs_image_t** out);

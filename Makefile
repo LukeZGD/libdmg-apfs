@@ -2,6 +2,8 @@
 #
 #   make                 build apfs-tool and dmg into build/
 #   make test            run the test suite
+#   make test CLEAN_TEST_IMAGES=1   run tests, then remove generated images
+#   make clean-test-images          remove generated test images only
 #   make install         install into $(PREFIX)/bin
 #   make CC=x86_64-w64-mingw32-gcc   cross-compile for Windows
 #
@@ -11,6 +13,7 @@ CC ?= cc
 AR ?= ar
 PREFIX ?= /usr/local
 BUILD ?= build
+CLEAN_TEST_IMAGES ?= 0
 
 UNAME_S := $(shell uname -s 2>/dev/null)
 TARGET_WIN := $(if $(findstring mingw,$(CC)),1,$(if $(findstring MINGW,$(UNAME_S)),1,))
@@ -39,7 +42,8 @@ APFS_SRC := apfs/util.c apfs/unicode.c apfs/btree.c apfs/omap.c apfs/spaceman.c 
 	apfs/container.c apfs/volume.c apfs/fs.c apfs/extents.c apfs/rawfile.c \
 	apfs/image.c apfs/debug.c apfs/snapshot.c apfs/compress.c apfs/file.c \
 	apfs/mkfs.c apfs/platform.c apfs/apfslib.c apfs/tar.c apfs/udif.c \
-	apfs/resize.c apfs/seal.c apfs/verify.c apfs/trustcache.c apfs/mtree.c
+	apfs/resize.c apfs/seal.c apfs/verify.c apfs/trustcache.c apfs/mtree.c \
+	apfs/crypto.c apfs/encrypted.c
 
 LIB_SRC := $(COMMON_SRC) $(APFS_SRC) $(LZFSE_SRC)
 LIB_OBJ := $(LIB_SRC:%.c=$(BUILD)/obj/%.o)
@@ -49,7 +53,7 @@ TOOL := $(BUILD)/apfs-tool$(EXE)
 DMG := $(BUILD)/dmg$(EXE)
 UNIT := $(BUILD)/unit$(EXE)
 
-.PHONY: all clean install test
+.PHONY: all clean clean-test-images install test
 
 all: $(TOOL) $(DMG)
 
@@ -81,6 +85,9 @@ test: $(TOOL) $(DMG) $(UNIT)
 	@mkdir -p $(BUILD)/test
 	$(UNIT) $(BUILD)/test
 	sh tests/run.sh $(TOOL) $(BUILD)/test
+ifeq ($(CLEAN_TEST_IMAGES),1)
+	$(MAKE) --no-print-directory clean-test-images BUILD="$(BUILD)"
+endif
 
 install: all
 	install -d $(DESTDIR)$(PREFIX)/bin
@@ -88,5 +95,16 @@ install: all
 
 clean:
 	rm -rf $(BUILD)
+
+# Keep binaries, object files, logs and small metadata while removing disk
+# images left by tests. Scanning all of BUILD also covers custom test output
+# directories made by direct tests/run.sh invocations.
+clean-test-images:
+	@if [ -d "$(BUILD)" ]; then \
+		find "$(BUILD)" \( -type f -o -type l \) \( \
+			-name '*.raw' -o -name '*.img' -o -name '*.dmg' -o \
+			-name '*.im4p' -o -name '*.aea' \
+		\) -delete; \
+	fi
 
 -include $(LIB_OBJ:.o=.d) $(BUILD)/obj/apfs/apfs-tool.d $(BUILD)/obj/apfs/dmg-tool.d $(BUILD)/obj/tests/unit.d

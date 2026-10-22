@@ -659,7 +659,7 @@ int udif_extract(udif_t* u, int part, FILE* out, int quiet) {
 	free(buf);
 	if(!quiet)
 		printf("\rExtracting... done\n");
-	return fflush(out) == 0 ? APFS_OK : APFS_EIO;
+	return plat_sparse_finish(out);
 }
 
 /* MediaKit block checksum, used by the cSum and nsiz resources */

@@ -65,6 +65,99 @@ static void test_digests(void) {
 	CHECK(!apfs_obj_verify(block, sizeof(block)));
 }
 
+static size_t unhex(const char* s, uint8_t* out) {
+	size_t n = 0;
+	unsigned v;
+	while(s[0] && s[1] && sscanf(s, "%2x", &v) == 1) {
+		out[n++] = (uint8_t)v;
+		s += 2;
+	}
+	return n;
+}
+
+static int is_hex(const uint8_t* p, size_t n, const char* expect) {
+	char s[257];
+	hex(p, n, s);
+	return !strcmp(s, expect);
+}
+
+/* Published test vectors (FIPS-197, SP 800-38A, RFC 2202, RFC 4231,
+ * RFC 6070, RFC 5869, the classic DES example), and the key blob of an
+ * image made by hdiutil with the passphrase "secret" */
+static void test_crypto(void) {
+	apfs_aes_ctx aes;
+	uint8_t key[160], iv[16], in[64], out[64], back[64], d[64], big[200];
+	size_t n;
+
+	unhex("000102030405060708090a0b0c0d0e0f", key);
+	unhex("00112233445566778899aabbccddeeff", in);
+	CHECK(apfs_aes_init(&aes, key, 16) == APFS_OK);
+	apfs_aes_encrypt(&aes, in, out);
+	CHECK(is_hex(out, 16, "69c4e0d86a7b0430d8cdb78070b4c55a"));
+	apfs_aes_decrypt(&aes, out, back);
+	CHECK(!memcmp(back, in, 16));
+	unhex("000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f", key);
+	CHECK(apfs_aes_init(&aes, key, 32) == APFS_OK);
+	apfs_aes_encrypt(&aes, in, out);
+	CHECK(is_hex(out, 16, "8ea2b7ca516745bfeafc49904b496089"));
+	apfs_aes_decrypt(&aes, out, back);
+	CHECK(!memcmp(back, in, 16));
+	CHECK(apfs_aes_init(&aes, key, 20) < 0);
+
+	unhex("2b7e151628aed2a6abf7158809cf4f3c", key);
+	unhex("000102030405060708090a0b0c0d0e0f", iv);
+	unhex("6bc1bee22e409f96e93d7e117393172aae2d8a571e03ac9c9eb76fac45af8e51", in);
+	apfs_aes_init(&aes, key, 16);
+	apfs_aes_cbc_encrypt(&aes, iv, in, out, 32);
+	CHECK(is_hex(out, 32, "7649abac8119b246cee98e9b12e9197d5086cb9b507219ee95db113a917678b2"));
+	apfs_aes_cbc_decrypt(&aes, iv, out, out, 32);
+	CHECK(!memcmp(out, in, 32));
+	/* the counter carries from the last byte into the one before */
+	unhex("603deb1015ca71be2b73aef0857d77811f352c073b6108d72d9810a30914dff4", key);
+	unhex("f0f1f2f3f4f5f6f7f8f9fafbfcfdfeff", iv);
+	apfs_aes_init(&aes, key, 32);
+	apfs_aes_ctr(&aes, iv, in, out, 29);
+	CHECK(is_hex(out, 29, "601ec313775789a5b7a7f504bbf3d228f443e3ca4d62b59aca84e990ca"));
+
+	/* single DES as triple DES with one key; the padding is then invalid */
+	unhex("133457799bbcdff1133457799bbcdff1133457799bbcdff1", key);
+	memset(iv, 0, 8);
+	unhex("85e813540f0ab405", d);
+	CHECK(apfs_des3_cbc_decrypt(key, iv, d, 8) < 0);
+	CHECK(is_hex(d, 8, "0123456789abcdef"));
+
+	memset(key, 0x0b, 22);
+	apfs_hmac_sha1(key, 20, "Hi There", 8, d);
+	CHECK(is_hex(d, 20, "b617318655057264e28bc0b6fb378c8ef146be00"));
+	apfs_hmac_sha256(key, 20, "Hi There", 8, d);
+	CHECK(is_hex(d, 32, "b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7"));
+	memset(big, 0xaa, 131);
+	apfs_hmac_sha256(big, 131, "Test Using Larger Than Block-Size Key - Hash Key First", 54, d);
+	CHECK(is_hex(d, 32, "60e431591ee0b67f0d8a26aacbf5b77f8e0bc6213728c5140546040f0ee37f54"));
+
+	apfs_pbkdf2_sha1("password", 8, (const uint8_t*)"salt", 4, 1, d, 20);
+	CHECK(is_hex(d, 20, "0c60c80f961f0e71f3a9b524af6012062fe037a6"));
+	apfs_pbkdf2_sha1("password", 8, (const uint8_t*)"salt", 4, 4096, d, 20);
+	CHECK(is_hex(d, 20, "4b007901b765489abead49d926f721d065a429c1"));
+	apfs_pbkdf2_sha1("passwordPASSWORDpassword", 24, (const uint8_t*)"saltSALTsaltSALTsaltSALTsaltSALTsalt", 36, 4096, d, 25);
+	CHECK(is_hex(d, 25, "3d2eec4fe41c849b80c8d83662c0e44a8b291a964cf2f07038"));
+
+	n = unhex("000102030405060708090a0b0c", in);
+	unhex("f0f1f2f3f4f5f6f7f8f9", iv);
+	apfs_hkdf_sha256(key, 22, in, n, iv, 10, d, 42);
+	CHECK(is_hex(d, 42, "3cb25f25faacd57a90434f64d0362f2a2d2d0a90cf1a5a4c5db02d56ecc4c5bf34007208d5b887185865"));
+	apfs_hkdf_sha256(key, 22, NULL, 0, NULL, 0, d, 42);
+	CHECK(is_hex(d, 42, "8da4e775a563c18f715f802a063c5a31b8a11f5c5ee1879ec3454e5f3c738d2d9d201395faa4b61a96c8"));
+
+	/* PBKDF2 then triple DES unwrap the AES key, the HMAC key and "CKIE\0" */
+	n = unhex("2fbec8e1dda02a9cd846861588726904a0b78190", in);
+	apfs_pbkdf2_sha1("secret", 6, in, n, 200000, key, 24);
+	unhex("89d0d0ff8eb92227", iv);
+	n = unhex("3b0d34e243e71a6465104c65e52c115dd1e56fc8237e015da07d8087f4ac2ba8a287ba0e191dd200b4f22090bc2fa64e", d);
+	CHECK(apfs_des3_cbc_decrypt(key, iv, d, n) == 41);
+	CHECK(is_hex(d, 41, "8ccd692a503af0cf8d148269d8d7265d8ccd692a503af0cf8d148269d8d7265d00000000434b494500"));
+}
+
 /* Hashes of names created by macOS on case-insensitive (ci = 1) and
  * case-sensitive volumes, as found in their directory records */
 static const struct {
@@ -1603,6 +1696,7 @@ int main(int argc, char** argv) {
 
 	apfs_verbosity = -1; /* expected failures would print errors */
 	test_digests();
+	test_crypto();
 	test_name_hashes();
 	test_trustcache(dir);
 	test_untar(dir);
