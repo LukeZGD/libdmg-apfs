@@ -1,0 +1,46 @@
+name: Build
+
+on: [push]
+
+jobs:
+  build-linux:
+    strategy:
+      matrix:
+        arch:
+          - runner: ubuntu-22.04
+            name: x86_64
+          - runner: ubuntu-22.04-arm
+            name: aarch64
+
+    name: build-linux-${{ matrix.arch.name }}
+    runs-on: ${{ matrix.arch.runner }}
+
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: recursive
+
+      - name: Install dependencies
+        run: |
+          sudo apt update
+          sudo apt install -y build-essential zlib1g-dev
+
+      - name: run make
+        run: |
+          make
+          rm -rf build/obj/
+
+      - name: Zip ${GITHUB_REPOSITORY#*/}
+        run: zip -r ${GITHUB_REPOSITORY#*/}_linux-${{ matrix.arch.name }}.zip build/
+
+      - name: Update latest release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release upload latest \
+            ${GITHUB_REPOSITORY#*/}_linux-${{ matrix.arch.name }}.zip \
+            --clobber -R ${{ github.repository }}
+
+          gh release edit latest \
+            --title "Latest" \
+            --target ${{ github.sha }} -R ${{ github.repository }}
